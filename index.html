@@ -1,4 +1,4 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <title>Own the Disruption Board</title>
 <style>
 /* Layout: one sticky navy bar of numbered stations; one station on screen at a time; one scribe per group types.
@@ -182,6 +182,8 @@ dd{margin:0}
 
 /* ---- Set by the facilitator: the licensed case link or file. Leave url empty until it is ready. ---- */
 const CASE = { url: "" };
+/* ---- Set by the facilitator: the Firebase Realtime Database URL, e.g. "https://otd-board-default-rtdb.europe-west1.firebasedatabase.app". ---- */
+const FIREBASE_URL = "https://gtech-m5-leadtech-default-rtdb.europe-west1.firebasedatabase.app";
 
 const KEY = "otd-m5-board-v2";
 const VIEWS = [["board", "", "Board"], ["warmup", "1", "Warm-up"], ["moves", "2", "Four moves"], ["debate", "3", "Board debate"], ["ladder", "4", "Our ladder"], ["library", "", "Case and reading"]];
@@ -246,18 +248,22 @@ function adopt(raw) {
 }
 let saveT = 0, storageOK = true;
 /* ---------- shared database: one document per group, boards/1 … boards/4. Every open browser follows it live. ---------- */
-let db = null, live = "off", canWrite = null, liveMsg = "";   // live: off | on | readonly
+let db = null, live = "off", canWrite = null, liveMsg = "";   // live: off | on | readonly · db is truthy while the stream is open
 const inflight = {}, dirty = {}, touched = {};
 let pushT = 0;
 async function pushGroup(g) {
   if (!db || canWrite === false) return;
   if (inflight[g]) { dirty[g] = true; return; }
   inflight[g] = true;
-  try { await db.doc("boards/" + g).set({ v: 2, g, d: state.groups[g], at: Date.now() }); liveMsg = ""; }
-  catch (e) { if (e && e.code === "invalid_argument") { canWrite = false; live = "readonly"; } else liveMsg = "Could not save to the shared board. Keep going; try again in a moment."; paintLive(); }
+  try {
+    const r = await fetch(`${FIREBASE_URL}/boards/${g}.json`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ v: 2, g, d: state.groups[g], at: Date.now() }) });
+    if (r.status === 401 || r.status === 403) { canWrite = false; live = "readonly"; liveMsg = "The shared board does not accept writes from this page. Ask the facilitator to check the database rules."; }
+    else if (!r.ok) liveMsg = "Could not save to the shared board. Keep going; it retries on your next edit.";
+    else liveMsg = "";
+  } catch (e) { liveMsg = "Could not reach the shared board. Keep going; it retries on your next edit."; }
+  paintLive();
   inflight[g] = false;
   if (dirty[g]) { dirty[g] = false; pushGroup(g); }
-  else if (db) { try { const s = await db.doc("boards/" + g).get(); applySnapshot({ docs: [s] }); } catch (e) { /* the live stream will catch up */ } }
 }
 function save() {
   clearTimeout(saveT);
@@ -266,12 +272,13 @@ function save() {
   clearTimeout(pushT);
   pushT = setTimeout(() => { for (const g in touched) { delete touched[g]; pushGroup(+g); } }, 600);
 }
-function applySnapshot(snap) {
+function applyBoards(obj) {   // obj: { "1": {v,g,d,at}, ... } — whatever the stream delivered
   let changed = false;
-  snap.docs.forEach(doc => {
-    const g = int(doc.id, 4); if (!g || !doc.exists) return;
+  if (!obj || typeof obj !== "object") return;
+  Object.keys(obj).forEach(k => {
+    const g = int(k, 4); if (!g) return;
     if (inflight[g] || touched[g] || dirty[g]) return;             // our own edit is on its way; keep the local copy
-    const body = doc.data() || {}, next = clean(body.d, g);
+    const body = obj[k] && typeof obj[k] === "object" ? obj[k] : {}, next = clean(body.d, g);
     if (JSON.stringify(next) !== JSON.stringify(state.groups[g])) { state.groups[g] = next; changed = true; }
   });
   if (changed) { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage may be off */ } refreshCode(); render(); }
@@ -280,20 +287,31 @@ function paintLive() {
   const el = document.getElementById("live"); if (!el) return;
   el.className = "live " + live;
   el.textContent = live === "on" ? "Live · shared" : live === "readonly" ? "Live · read-only" : "This device only";
-  el.title = live === "on" ? "What you type here reaches everyone who has this page open." : live === "readonly" ? "You can follow the board but not type on it. Ask the facilitator for Contributor access." : "Not connected to the shared board. Notes stay in this browser.";
+  el.title = live === "on" ? "What you type here reaches everyone who has this page open." : live === "readonly" ? "You can follow the board but not type on it. Tell the facilitator." : "Not connected to the shared board. Notes stay in this browser.";
 }
-async function connectDb() {
-  if (!window.claude || typeof window.claude.use !== "function") return;
-  try {
-    const [d, u] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
-    if (!d) return;
-    db = d;
-    if (u) { try { canWrite = await u.can("data.write"); } catch (e) { canWrite = null; } }
-    live = canWrite === false ? "readonly" : "on"; paintLive();
-    db.collection("boards").onSnapshot(applySnapshot, err => {
-      db = null; live = "off"; liveMsg = "Lost the shared board. Reload the page to reconnect."; paintLive();
-    });
-  } catch (e) { db = null; live = "off"; paintLive(); }
+function connectDb() {
+  if (!FIREBASE_URL || typeof EventSource !== "function") return;
+  let es;
+  const open = () => {
+    es = new EventSource(`${FIREBASE_URL}/boards.json`);
+    es.addEventListener("open", () => { db = true; live = "on"; liveMsg = ""; paintLive(); });
+    const onData = e => {
+      let m; try { m = JSON.parse(e.data); } catch (err) { return; }
+      if (!m || typeof m.path !== "string") return;
+      if (m.path === "/") applyBoards(m.data || {});
+      else {
+        const parts = m.path.split("/"), g = parts[1];
+        if (!g) return;
+        if (parts.length === 2) applyBoards({ [g]: m.data });   // a whole group arrived
+        else fetch(`${FIREBASE_URL}/boards/${g}.json`).then(r => r.json()).then(d => applyBoards({ [g]: d })).catch(() => {});   // a partial change: re-read that group
+      }
+    };
+    es.addEventListener("put", onData);
+    es.addEventListener("patch", onData);
+    es.addEventListener("auth_revoked", () => { es.close(); live = "readonly"; paintLive(); });
+    es.addEventListener("error", () => { if (es.readyState === EventSource.CLOSED) { db = null; live = "off"; liveMsg = "Lost the shared board. Reconnecting…"; paintLive(); setTimeout(open, 3000); } });
+  };
+  open();
 }
 const G = () => state.groups[state.group];
 const filled = a => a.filter(s => s.trim()).length;
